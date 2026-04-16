@@ -1,0 +1,136 @@
+name: Publish Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: Public HTTP/HTTPS URL to download and split
+        required: true
+        type: string
+      image_repository:
+        description: Docker Hub repository in namespace/name form
+        required: true
+        type: string
+      image_tag:
+        description: Primary Docker tag to publish
+        required: false
+        default: latest
+        type: string
+      chunk_mb:
+        description: Chunk size in decimal MB
+        required: false
+        default: "500"
+        type: string
+      file_name:
+        description: Optional output filename override
+        required: false
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run test suite
+        run: npm test
+
+      - name: Resolve publish inputs
+        id: config
+        shell: bash
+        env:
+          DOWNLOAD_URL: ${{ inputs.download_url }}
+          IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          CHUNK_MB: ${{ inputs.chunk_mb }}
+          FILE_NAME: ${{ inputs.file_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "download_url input is required." >&2
+            exit 1
+          fi
+
+          if [ -z "$IMAGE_REPOSITORY" ]; then
+            echo "image_repository input is required." >&2
+            exit 1
+          fi
+
+          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+          echo "image_repository=$IMAGE_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG:-latest}" >> "$GITHUB_OUTPUT"
+          echo "chunk_mb=${CHUNK_MB:-500}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${FILE_NAME:-}" ]; then
+            echo "file_name=$FILE_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate Docker build context
+        id: generate
+        shell: bash
+        env:
+          DOWNLOAD_URL: ${{ steps.config.outputs.download_url }}
+          CHUNK_MB: ${{ steps.config.outputs.chunk_mb }}
+          FILE_NAME: ${{ steps.config.outputs.file_name }}
+        run: |
+          set -euo pipefail
+
+          args=(download-and-split.js "$DOWNLOAD_URL" --chunk-mb "$CHUNK_MB" --out-dir ./output --force)
+
+          if [ -n "${FILE_NAME:-}" ]; then
+            args+=(--name "$FILE_NAME")
+          fi
+
+          run_output="$(node "${args[@]}")"
+          printf '%s\n' "$run_output"
+
+          context_dir="$(printf '%s\n' "$run_output" | awk -F': ' '/^Output:/ {print $2}')"
+          if [ -z "$context_dir" ]; then
+            echo "Failed to determine the generated Docker context directory." >&2
+            exit 1
+          fi
+
+          workspace_prefix="${GITHUB_WORKSPACE%/}/"
+          context_dir="${context_dir#$workspace_prefix}"
+
+          echo "context_dir=$context_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.generate.outputs.context_dir }}
+          push: true
+          tags: |
+            ${{ steps.config.outputs.image_repository }}:${{ steps.config.outputs.image_tag }}
+            ${{ steps.config.outputs.image_repository }}:sha-${{ github.sha }}
+
+      - name: Write workflow summary
+        shell: bash
+        env:
+          IMAGE_REPOSITORY: ${{ steps.config.outputs.image_repository }}
+          IMAGE_TAG: ${{ steps.config.outputs.image_tag }}
+          CONTEXT_DIR: ${{ steps.generate.outputs.context_dir }}
+        run: |
+          {
+            echo "## Docker publish complete"
+            echo
+            echo "- Image: \`$IMAGE_REPOSITORY:$IMAGE_TAG\`"
+            echo "- Extra tag: \`$IMAGE_REPOSITORY:sha-${GITHUB_SHA}\`"
+            echo "- Build context: \`$CONTEXT_DIR\`"
+          } >> "$GITHUB_STEP_SUMMARY"

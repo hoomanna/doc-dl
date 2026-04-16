@@ -1,0 +1,9 @@
+{
+  "name": "docker-dl",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "chunk": "node download-and-split.js",
+    "test": "node --test"
+  }
+}
