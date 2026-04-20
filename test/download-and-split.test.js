@@ -12,6 +12,7 @@ const test = require("node:test");
 
 const {
   createChunkName,
+  parseArgs,
   run,
 } = require("../download-and-split");
 
@@ -142,6 +143,67 @@ test("splits larger payloads into ordered chunks", async (t) => {
   );
 
   assert.deepEqual(restored, payload);
+});
+
+test("parses a local file path as chunk input", () => {
+  const options = parseArgs([
+    "./fixtures/source-image.tar",
+    "--chunk-mb",
+    "12.5",
+    "--name",
+    "saved-image.tar",
+  ]);
+
+  assert.equal(options.filePath, path.resolve("./fixtures/source-image.tar"));
+  assert.equal(options.fileName, "saved-image.tar");
+  assert.equal(options.chunkSizeBytes, 12_500_000);
+});
+
+test("chunks a local file into an equivalent Docker context", async (t) => {
+  const payload = Buffer.concat([
+    createPayload(9, "x"),
+    createPayload(9, "y"),
+    createPayload(9, "z"),
+  ]);
+  const tempDir = await createTempDir();
+  const sourcePath = path.join(tempDir, "source-image.tar");
+
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  await fs.writeFile(sourcePath, payload);
+
+  const result = await run({
+    filePath: sourcePath,
+    chunkSizeBytes: 10,
+    outDir: tempDir,
+    fileName: "saved-image.tar",
+    force: false,
+  });
+
+  assert.deepEqual(result.chunkNames, [
+    "saved-image.tar.part0001",
+    "saved-image.tar.part0002",
+    "saved-image.tar.part0003",
+  ]);
+
+  const restored = Buffer.concat(
+    await Promise.all(
+      result.chunkNames.map((chunkName) =>
+        fs.readFile(path.join(result.chunksDir, chunkName)),
+      ),
+    ),
+  );
+
+  assert.deepEqual(restored, payload);
+
+  const dockerfile = await fs.readFile(result.dockerfilePath, "utf8");
+  assert.match(
+    dockerfile,
+    /COPY chunks\/saved-image\.tar\.part0001 \/opt\/chunks\/saved-image\.tar\.part0001/,
+  );
+  assert.equal((dockerfile.match(/^COPY chunks\//gm) || []).length, 3);
 });
 
 test("follows redirects before downloading", async (t) => {

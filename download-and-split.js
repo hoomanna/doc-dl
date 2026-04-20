@@ -20,7 +20,7 @@ class UsageError extends Error {}
 function usage() {
   return [
     "Usage:",
-    "  node download-and-split.js <url> [--chunk-mb 500] [--out-dir ./output] [--name <filename>] [--force]",
+    "  node download-and-split.js <url-or-file> [--chunk-mb 500] [--out-dir ./output] [--name <filename>] [--force]",
   ].join("\n");
 }
 
@@ -39,14 +39,24 @@ function sanitizeFileName(input) {
   return normalized;
 }
 
-function deriveFileName(urlString, overrideName) {
+function deriveFileName(sourceInput, overrideName) {
   if (overrideName) {
     return sanitizeFileName(overrideName);
   }
 
-  const url = new URL(urlString);
-  const baseName = path.posix.basename(decodeURIComponent(url.pathname));
-  return sanitizeFileName(baseName || DEFAULT_FILE_NAME);
+  try {
+    const parsedUrl = new URL(sourceInput);
+
+    if (parsedUrl.protocol === "file:") {
+      const filePath = decodeURIComponent(parsedUrl.pathname);
+      return sanitizeFileName(path.basename(filePath) || DEFAULT_FILE_NAME);
+    }
+
+    const baseName = path.posix.basename(decodeURIComponent(parsedUrl.pathname));
+    return sanitizeFileName(baseName || DEFAULT_FILE_NAME);
+  } catch {
+    return sanitizeFileName(path.basename(String(sourceInput)) || DEFAULT_FILE_NAME);
+  }
 }
 
 function toChunkSizeBytes(chunkMb) {
@@ -60,13 +70,49 @@ function toChunkSizeBytes(chunkMb) {
   return Math.max(bytes, 1);
 }
 
+function isWindowsDrivePath(value) {
+  return /^[A-Za-z]:[\\/]/.test(String(value));
+}
+
+function parseSourceInput(sourceInput) {
+  const rawValue = String(sourceInput || "");
+
+  if (!rawValue) {
+    throw new UsageError("A download URL or local file path is required.");
+  }
+
+  try {
+    const parsedUrl = new URL(rawValue);
+
+    if (["http:", "https:"].includes(parsedUrl.protocol)) {
+      return { url: parsedUrl.toString() };
+    }
+
+    if (parsedUrl.protocol === "file:") {
+      return { filePath: path.resolve(decodeURIComponent(parsedUrl.pathname)) };
+    }
+
+    throw new UsageError("Only http, https, and local file paths are supported.");
+  } catch (error) {
+    if (error instanceof UsageError) {
+      throw error;
+    }
+
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(rawValue) && !isWindowsDrivePath(rawValue)) {
+      throw new UsageError("Only http, https, and local file paths are supported.");
+    }
+
+    return { filePath: path.resolve(rawValue) };
+  }
+}
+
 function parseArgs(argv) {
   if (!Array.isArray(argv) || argv.length === 0) {
-    throw new UsageError("A download URL is required.");
+    throw new UsageError("A download URL or local file path is required.");
   }
 
   const args = [...argv];
-  let urlString = null;
+  let sourceInput = null;
   let chunkMb = DEFAULT_CHUNK_MB;
   let outDir = DEFAULT_OUT_DIR;
   let name = null;
@@ -115,26 +161,18 @@ function parseArgs(argv) {
       throw new UsageError(`Unknown option: ${arg}`);
     }
 
-    if (urlString) {
-      throw new UsageError("Only one download URL may be provided.");
+    if (sourceInput) {
+      throw new UsageError("Only one download URL or local file path may be provided.");
     }
 
-    urlString = arg;
+    sourceInput = arg;
   }
 
-  if (!urlString) {
-    throw new UsageError("A download URL is required.");
-  }
-
-  const parsedUrl = new URL(urlString);
-  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
-    throw new UsageError("Only http and https URLs are supported.");
-  }
-
-  const fileName = deriveFileName(urlString, name);
+  const source = parseSourceInput(sourceInput);
+  const fileName = deriveFileName(sourceInput, name);
 
   return {
-    url: parsedUrl.toString(),
+    ...source,
     chunkMb: Number.parseFloat(String(chunkMb)),
     chunkSizeBytes: toChunkSizeBytes(chunkMb),
     outDir: path.resolve(outDir),
@@ -267,8 +305,7 @@ async function writeToStream(stream, buffer) {
   }
 }
 
-async function downloadFileInChunks({ url, chunkSizeBytes, chunksDir, fileName }) {
-  const response = await requestWithRedirects(url);
+async function splitStreamIntoChunks({ stream, chunkSizeBytes, chunksDir, fileName }) {
   const sha256 = createHash("sha256");
   const chunkNames = [];
   let currentStream = null;
@@ -293,7 +330,7 @@ async function downloadFileInChunks({ url, chunkSizeBytes, chunksDir, fileName }
 
   await rotateChunk();
 
-  for await (const rawChunk of response) {
+  for await (const rawChunk of stream) {
     const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
     let offset = 0;
 
@@ -323,6 +360,16 @@ async function downloadFileInChunks({ url, chunkSizeBytes, chunksDir, fileName }
     chunkNames,
     sha256: sha256.digest("hex"),
   };
+}
+
+async function downloadFileInChunks({ url, chunkSizeBytes, chunksDir, fileName }) {
+  const response = await requestWithRedirects(url);
+  return splitStreamIntoChunks({ stream: response, chunkSizeBytes, chunksDir, fileName });
+}
+
+async function splitLocalFileInChunks({ filePath, chunkSizeBytes, chunksDir, fileName }) {
+  const stream = fs.createReadStream(filePath);
+  return splitStreamIntoChunks({ stream, chunkSizeBytes, chunksDir, fileName });
 }
 
 async function writeGeneratedFiles(targetRoot, metadata) {
@@ -368,12 +415,25 @@ async function run(options) {
     await fsp.mkdir(chunksDir, { recursive: true });
     targetPrepared = true;
 
-    const downloadResult = await downloadFileInChunks({
-      url: options.url,
-      chunkSizeBytes: options.chunkSizeBytes,
-      chunksDir,
-      fileName: options.fileName,
-    });
+    let downloadResult;
+
+    if (options.url) {
+      downloadResult = await downloadFileInChunks({
+        url: options.url,
+        chunkSizeBytes: options.chunkSizeBytes,
+        chunksDir,
+        fileName: options.fileName,
+      });
+    } else if (options.filePath) {
+      downloadResult = await splitLocalFileInChunks({
+        filePath: options.filePath,
+        chunkSizeBytes: options.chunkSizeBytes,
+        chunksDir,
+        fileName: options.fileName,
+      });
+    } else {
+      throw new Error("Either a download URL or local file path must be provided.");
+    }
 
     const generatedFiles = await writeGeneratedFiles(targetRoot, {
       ...downloadResult,
@@ -436,8 +496,10 @@ module.exports = {
   generateDockerfile,
   generateEntrypoint,
   parseArgs,
+  parseSourceInput,
   run,
   runCli,
   sanitizeFileName,
+  splitLocalFileInChunks,
   toChunkSizeBytes,
 };

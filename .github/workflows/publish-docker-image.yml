@@ -7,19 +7,10 @@ on:
         description: Public HTTP/HTTPS URL to download and split
         required: true
         type: string
-      image_repository:
-        description: Docker Hub repository in namespace/name form
-        required: true
-        type: string
       image_tag:
         description: Primary Docker tag to publish
         required: false
         default: latest
-        type: string
-      chunk_mb:
-        description: Chunk size in decimal MB
-        required: false
-        default: "500"
         type: string
       file_name:
         description: Optional output filename override
@@ -49,9 +40,9 @@ jobs:
         shell: bash
         env:
           DOWNLOAD_URL: ${{ inputs.download_url }}
-          IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+          IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_REPOSITORY }}
           IMAGE_TAG: ${{ inputs.image_tag }}
-          CHUNK_MB: ${{ inputs.chunk_mb }}
+          CHUNK_MB: ${{ secrets.DOCKER_CHUNK_MB }}
           FILE_NAME: ${{ inputs.file_name }}
         run: |
           set -euo pipefail
@@ -62,14 +53,19 @@ jobs:
           fi
 
           if [ -z "$IMAGE_REPOSITORY" ]; then
-            echo "image_repository input is required." >&2
+            echo "DOCKERHUB_REPOSITORY secret is required." >&2
+            exit 1
+          fi
+
+          if [ -z "$CHUNK_MB" ]; then
+            echo "DOCKER_CHUNK_MB secret is required." >&2
             exit 1
           fi
 
           echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
           echo "image_repository=$IMAGE_REPOSITORY" >> "$GITHUB_OUTPUT"
           echo "image_tag=${IMAGE_TAG:-latest}" >> "$GITHUB_OUTPUT"
-          echo "chunk_mb=${CHUNK_MB:-500}" >> "$GITHUB_OUTPUT"
+          echo "chunk_mb=$CHUNK_MB" >> "$GITHUB_OUTPUT"
 
           if [ -n "${FILE_NAME:-}" ]; then
             echo "file_name=$FILE_NAME" >> "$GITHUB_OUTPUT"
