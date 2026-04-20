@@ -20,7 +20,8 @@ class UsageError extends Error {}
 function usage() {
   return [
     "Usage:",
-    "  node download-and-split.js <url-or-file> [--chunk-mb 500] [--out-dir ./output] [--name <filename>] [--force]",
+    "  node download-and-split.js <source> [--chunk-mb 500] [--out-dir ./output] [--name <filename>] [--force]",
+    "  <source> may be an http/https URL, a local file path, or - for stdin.",
   ].join("\n");
 }
 
@@ -79,6 +80,10 @@ function parseSourceInput(sourceInput) {
 
   if (!rawValue) {
     throw new UsageError("A download URL or local file path is required.");
+  }
+
+  if (rawValue === "-") {
+    return { stdin: true };
   }
 
   try {
@@ -424,6 +429,13 @@ async function run(options) {
         chunksDir,
         fileName: options.fileName,
       });
+    } else if (options.stdin) {
+      downloadResult = await splitStreamIntoChunks({
+        stream: options.inputStream ?? process.stdin,
+        chunkSizeBytes: options.chunkSizeBytes,
+        chunksDir,
+        fileName: options.fileName,
+      });
     } else if (options.filePath) {
       downloadResult = await splitLocalFileInChunks({
         filePath: options.filePath,
@@ -460,7 +472,10 @@ async function run(options) {
 async function runCli(argv = process.argv.slice(2), io = {}) {
   const stdout = io.stdout ?? process.stdout;
   const options = parseArgs(argv);
-  const result = await run(options);
+  const result = await run({
+    ...options,
+    inputStream: io.stdin ?? process.stdin,
+  });
 
   stdout.write(`Output: ${result.targetRoot}\n`);
   stdout.write(`Chunks: ${result.chunkNames.length}\n`);
@@ -500,6 +515,7 @@ module.exports = {
   run,
   runCli,
   sanitizeFileName,
+  splitStreamIntoChunks,
   splitLocalFileInChunks,
   toChunkSizeBytes,
 };

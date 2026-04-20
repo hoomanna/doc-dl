@@ -13,7 +13,7 @@ on:
         default: latest
         type: string
       archive_name:
-        description: Optional tar filename override for docker save output
+        description: Optional tar filename to use for the streamed docker save archive
         required: false
         type: string
       dockerhub_username:
@@ -39,6 +39,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker system prune -af --volumes || true
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h
 
       - name: Run test suite
         run: npm test
@@ -111,35 +120,18 @@ jobs:
           username: ${{ inputs.dockerhub_username || secrets.DOCKERHUB_USERNAME }}
           password: ${{ inputs.dockerhub_token || secrets.DOCKERHUB_TOKEN }}
 
-      - name: Pull and save source image
-        id: source
-        shell: bash
-        env:
-          SOURCE_IMAGE: ${{ steps.config.outputs.source_image }}
-          ARCHIVE_NAME: ${{ steps.config.outputs.archive_name }}
-        run: |
-          set -euo pipefail
-
-          artifacts_dir="$GITHUB_WORKSPACE/artifacts"
-          archive_path="$artifacts_dir/$ARCHIVE_NAME"
-
-          mkdir -p "$artifacts_dir"
-          docker pull "$SOURCE_IMAGE"
-          docker save --output "$archive_path" "$SOURCE_IMAGE"
-
-          echo "archive_path=$archive_path" >> "$GITHUB_OUTPUT"
-
-      - name: Generate Docker build context
+      - name: Pull and split source image
         id: generate
         shell: bash
         env:
-          ARCHIVE_PATH: ${{ steps.source.outputs.archive_path }}
+          SOURCE_IMAGE: ${{ steps.config.outputs.source_image }}
           ARCHIVE_NAME: ${{ steps.config.outputs.archive_name }}
           CHUNK_MB: ${{ steps.config.outputs.chunk_mb }}
         run: |
           set -euo pipefail
 
-          run_output="$(node download-and-split.js "$ARCHIVE_PATH" --chunk-mb "$CHUNK_MB" --out-dir ./output --name "$ARCHIVE_NAME" --force)"
+          docker pull "$SOURCE_IMAGE"
+          run_output="$(docker save "$SOURCE_IMAGE" | node download-and-split.js - --chunk-mb "$CHUNK_MB" --out-dir ./output --name "$ARCHIVE_NAME" --force)"
           printf '%s\n' "$run_output"
 
           context_dir="$(printf '%s\n' "$run_output" | awk -F': ' '/^Output:/ {print $2}')"
@@ -152,6 +144,18 @@ jobs:
           context_dir="${context_dir#$workspace_prefix}"
 
           echo "context_dir=$context_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Clean up source image and Docker cache
+        if: always()
+        shell: bash
+        env:
+          SOURCE_IMAGE: ${{ steps.config.outputs.source_image }}
+        run: |
+          set -euo pipefail
+
+          docker image rm "$SOURCE_IMAGE" || true
+          docker system prune -af --volumes || true
+          df -h
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -177,6 +181,6 @@ jobs:
             echo "- Source image: \`$SOURCE_IMAGE\`"
             echo "- Image: \`$IMAGE_REPOSITORY:$IMAGE_TAG\`"
             echo "- Extra tag: \`$IMAGE_REPOSITORY:sha-${GITHUB_SHA}\`"
-            echo "- Saved archive: \`$ARCHIVE_NAME\`"
+            echo "- Archive name: \`$ARCHIVE_NAME\`"
             echo "- Build context: \`$CONTEXT_DIR\`"
           } >> "$GITHUB_STEP_SUMMARY"

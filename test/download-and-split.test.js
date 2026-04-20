@@ -159,6 +159,17 @@ test("parses a local file path as chunk input", () => {
   assert.equal(options.chunkSizeBytes, 12_500_000);
 });
 
+test("parses stdin as chunk input", () => {
+  const options = parseArgs([
+    "-",
+    "--name",
+    "streamed-image.tar",
+  ]);
+
+  assert.equal(options.stdin, true);
+  assert.equal(options.fileName, "streamed-image.tar");
+});
+
 test("chunks a local file into an equivalent Docker context", async (t) => {
   const payload = Buffer.concat([
     createPayload(9, "x"),
@@ -204,6 +215,44 @@ test("chunks a local file into an equivalent Docker context", async (t) => {
     /COPY chunks\/saved-image\.tar\.part0001 \/opt\/chunks\/saved-image\.tar\.part0001/,
   );
   assert.equal((dockerfile.match(/^COPY chunks\//gm) || []).length, 3);
+});
+
+test("chunks stdin into an equivalent Docker context", async (t) => {
+  const payload = Buffer.concat([
+    createPayload(8, "m"),
+    createPayload(8, "n"),
+    createPayload(8, "o"),
+  ]);
+  const tempDir = await createTempDir();
+
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const result = await run({
+    stdin: true,
+    inputStream: Readable.from([payload.subarray(0, 7), payload.subarray(7, 19), payload.subarray(19)]),
+    chunkSizeBytes: 10,
+    outDir: tempDir,
+    fileName: "streamed-image.tar",
+    force: false,
+  });
+
+  assert.deepEqual(result.chunkNames, [
+    "streamed-image.tar.part0001",
+    "streamed-image.tar.part0002",
+    "streamed-image.tar.part0003",
+  ]);
+
+  const restored = Buffer.concat(
+    await Promise.all(
+      result.chunkNames.map((chunkName) =>
+        fs.readFile(path.join(result.chunksDir, chunkName)),
+      ),
+    ),
+  );
+
+  assert.deepEqual(restored, payload);
 });
 
 test("follows redirects before downloading", async (t) => {
