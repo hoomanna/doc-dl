@@ -1,0 +1,211 @@
+name: Publish Hugging Face File
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_id:
+        description: Hugging Face repository id, for example meta-llama/Llama-3.1-8B-Instruct
+        required: true
+        type: string
+      file_path:
+        description: File path inside the Hugging Face repository
+        required: true
+        type: string
+      revision:
+        description: Branch, tag, or commit to download from
+        required: false
+        default: main
+        type: string
+      repo_type:
+        description: Hugging Face repository type
+        required: false
+        default: model
+        type: choice
+        options:
+          - model
+          - dataset
+          - space
+      image_tag:
+        description: Primary Docker tag to publish
+        required: false
+        default: latest
+        type: string
+      file_name:
+        description: Optional output filename override
+        required: false
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker system prune -af --volumes || true
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h
+
+      - name: Run test suite
+        run: npm test
+
+      - name: Resolve publish inputs
+        id: config
+        shell: bash
+        env:
+          REPO_ID: ${{ inputs.repo_id }}
+          FILE_PATH: ${{ inputs.file_path }}
+          REVISION: ${{ inputs.revision }}
+          REPO_TYPE: ${{ inputs.repo_type }}
+          IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_REPOSITORY }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          CHUNK_MB: ${{ secrets.DOCKER_CHUNK_MB }}
+          FILE_NAME: ${{ inputs.file_name }}
+          HF_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$REPO_ID" ]; then
+            echo "repo_id input is required." >&2
+            exit 1
+          fi
+
+          if [ -z "$FILE_PATH" ]; then
+            echo "file_path input is required." >&2
+            exit 1
+          fi
+
+          if [ -z "$IMAGE_REPOSITORY" ]; then
+            echo "DOCKERHUB_REPOSITORY secret is required." >&2
+            exit 1
+          fi
+
+          if [ -z "$CHUNK_MB" ]; then
+            echo "DOCKER_CHUNK_MB secret is required." >&2
+            exit 1
+          fi
+
+          if [ -n "${HF_TOKEN:-}" ]; then
+            echo "::add-mask::$HF_TOKEN"
+          fi
+
+          case "${REPO_TYPE:-model}" in
+            model)
+              resolved_repo_type="model"
+              ;;
+            dataset)
+              resolved_repo_type="dataset"
+              ;;
+            space)
+              resolved_repo_type="space"
+              ;;
+            *)
+              echo "repo_type must be model, dataset, or space." >&2
+              exit 1
+              ;;
+          esac
+
+          resolved_revision="${REVISION:-main}"
+          hf_url="$(
+            REPO_TYPE="$resolved_repo_type" RESOLVED_REVISION="$resolved_revision" node -e '
+              const { buildHuggingFaceUrl } = require("./download-and-split");
+              process.stdout.write(buildHuggingFaceUrl({
+                repoType: process.env.REPO_TYPE,
+                repoId: process.env.REPO_ID,
+                revision: process.env.RESOLVED_REVISION,
+                filePath: process.env.FILE_PATH,
+              }));
+            '
+          )"
+
+          echo "hf_url=$hf_url" >> "$GITHUB_OUTPUT"
+          echo "repo_id=$REPO_ID" >> "$GITHUB_OUTPUT"
+          echo "file_path=$FILE_PATH" >> "$GITHUB_OUTPUT"
+          echo "revision=$resolved_revision" >> "$GITHUB_OUTPUT"
+          echo "repo_type=$resolved_repo_type" >> "$GITHUB_OUTPUT"
+          echo "image_repository=$IMAGE_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG:-latest}" >> "$GITHUB_OUTPUT"
+          echo "chunk_mb=$CHUNK_MB" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${FILE_NAME:-}" ]; then
+            echo "file_name=$FILE_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate Docker build context
+        id: generate
+        shell: bash
+        env:
+          HF_URL: ${{ steps.config.outputs.hf_url }}
+          HF_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+          CHUNK_MB: ${{ steps.config.outputs.chunk_mb }}
+          FILE_NAME: ${{ steps.config.outputs.file_name }}
+        run: |
+          set -euo pipefail
+
+          args=(download-and-split.js "$HF_URL" --chunk-mb "$CHUNK_MB" --out-dir ./output --force)
+
+          if [ -n "${FILE_NAME:-}" ]; then
+            args+=(--name "$FILE_NAME")
+          fi
+
+          run_output="$(node "${args[@]}")"
+          printf '%s\n' "$run_output"
+
+          context_dir="$(printf '%s\n' "$run_output" | awk -F': ' '/^Output:/ {print $2}')"
+          if [ -z "$context_dir" ]; then
+            echo "Failed to determine the generated Docker context directory." >&2
+            exit 1
+          fi
+
+          workspace_prefix="${GITHUB_WORKSPACE%/}/"
+          context_dir="${context_dir#$workspace_prefix}"
+
+          echo "context_dir=$context_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.generate.outputs.context_dir }}
+          push: true
+          tags: |
+            ${{ steps.config.outputs.image_repository }}:${{ steps.config.outputs.image_tag }}
+            ${{ steps.config.outputs.image_repository }}:sha-${{ github.sha }}
+
+      - name: Write workflow summary
+        shell: bash
+        env:
+          REPO_ID: ${{ steps.config.outputs.repo_id }}
+          FILE_PATH: ${{ steps.config.outputs.file_path }}
+          REVISION: ${{ steps.config.outputs.revision }}
+          REPO_TYPE: ${{ steps.config.outputs.repo_type }}
+          IMAGE_REPOSITORY: ${{ steps.config.outputs.image_repository }}
+          IMAGE_TAG: ${{ steps.config.outputs.image_tag }}
+          CONTEXT_DIR: ${{ steps.generate.outputs.context_dir }}
+        run: |
+          {
+            echo "## Docker publish complete"
+            echo
+            echo "- Hugging Face source: \`$REPO_TYPE/$REPO_ID@$REVISION:$FILE_PATH\`"
+            echo "- Image: \`$IMAGE_REPOSITORY:$IMAGE_TAG\`"
+            echo "- Extra tag: \`$IMAGE_REPOSITORY:sha-${GITHUB_SHA}\`"
+            echo "- Build context: \`$CONTEXT_DIR\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -14,6 +14,7 @@ const DEFAULT_CHUNK_SIZE_BYTES = 500_000_000;
 const DEFAULT_OUT_DIR = "./output";
 const DEFAULT_FILE_NAME = "download.bin";
 const MAX_REDIRECTS = 5;
+const HUGGING_FACE_HOST = "huggingface.co";
 
 class UsageError extends Error {}
 
@@ -21,7 +22,10 @@ function usage() {
   return [
     "Usage:",
     "  node download-and-split.js <source> [--chunk-mb 500] [--out-dir ./output] [--name <filename>] [--force]",
-    "  <source> may be an http/https URL, a local file path, or - for stdin.",
+    "  <source> may be an http/https URL, an hf:// source, a local file path, or - for stdin.",
+    "  Hugging Face sources use hf://<repo-id>/resolve/<revision>/<file-path>.",
+    "  Prefix datasets or spaces with hf://datasets/... or hf://spaces/....",
+    "  Set HF_TOKEN or HUGGINGFACE_TOKEN for private or gated Hugging Face files.",
   ].join("\n");
 }
 
@@ -75,6 +79,98 @@ function isWindowsDrivePath(value) {
   return /^[A-Za-z]:[\\/]/.test(String(value));
 }
 
+function encodeSlashSeparatedPath(value) {
+  return String(value)
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+function normalizeHuggingFaceRepoType(value) {
+  switch (String(value || "model").toLowerCase()) {
+    case "model":
+    case "models":
+      return "model";
+    case "dataset":
+    case "datasets":
+      return "dataset";
+    case "space":
+    case "spaces":
+      return "space";
+    default:
+      throw new UsageError("Hugging Face repo type must be model, dataset, or space.");
+  }
+}
+
+function buildHuggingFaceUrl({ repoType = "model", repoId, revision = "main", filePath }) {
+  const normalizedRepoType = normalizeHuggingFaceRepoType(repoType);
+  const cleanRepoId = String(repoId || "").replace(/^\/+|\/+$/g, "");
+  const cleanRevision = String(revision || "main");
+  const cleanFilePath = String(filePath || "").replace(/^\/+/, "");
+
+  if (!cleanRepoId) {
+    throw new UsageError("Hugging Face repo id is required.");
+  }
+
+  if (!cleanRevision) {
+    throw new UsageError("Hugging Face revision is required.");
+  }
+
+  if (!cleanFilePath) {
+    throw new UsageError("Hugging Face file path is required.");
+  }
+
+  const repoPrefix = normalizedRepoType === "model" ? "" : `${normalizedRepoType}s/`;
+
+  return [
+    `https://${HUGGING_FACE_HOST}`,
+    repoPrefix ? repoPrefix.slice(0, -1) : null,
+    encodeSlashSeparatedPath(cleanRepoId),
+    "resolve",
+    encodeURIComponent(cleanRevision),
+    encodeSlashSeparatedPath(cleanFilePath),
+  ]
+    .filter(Boolean)
+    .join("/");
+}
+
+function parseHuggingFaceSource(sourceInput) {
+  const sourcePath = String(sourceInput).slice("hf://".length).split(/[?#]/, 1)[0];
+  const segments = sourcePath
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => decodeURIComponent(segment));
+
+  let repoType = "model";
+
+  if (["model", "models", "dataset", "datasets", "space", "spaces"].includes(segments[0])) {
+    repoType = normalizeHuggingFaceRepoType(segments.shift());
+  }
+
+  const resolveIndex = segments.indexOf("resolve");
+
+  if (resolveIndex <= 0 || resolveIndex + 2 >= segments.length) {
+    throw new UsageError(
+      "Hugging Face sources must use hf://<repo-id>/resolve/<revision>/<file-path>.",
+    );
+  }
+
+  const repoId = segments.slice(0, resolveIndex).join("/");
+  const revision = segments[resolveIndex + 1];
+  const filePath = segments.slice(resolveIndex + 2).join("/");
+
+  return {
+    url: buildHuggingFaceUrl({ repoType, repoId, revision, filePath }),
+    huggingFace: {
+      repoType,
+      repoId,
+      revision,
+      filePath,
+    },
+  };
+}
+
 function parseSourceInput(sourceInput) {
   const rawValue = String(sourceInput || "");
 
@@ -97,14 +193,18 @@ function parseSourceInput(sourceInput) {
       return { filePath: path.resolve(decodeURIComponent(parsedUrl.pathname)) };
     }
 
-    throw new UsageError("Only http, https, and local file paths are supported.");
+    if (parsedUrl.protocol === "hf:") {
+      return parseHuggingFaceSource(rawValue);
+    }
+
+    throw new UsageError("Only http, https, hf, and local file paths are supported.");
   } catch (error) {
     if (error instanceof UsageError) {
       throw error;
     }
 
     if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(rawValue) && !isWindowsDrivePath(rawValue)) {
-      throw new UsageError("Only http, https, and local file paths are supported.");
+      throw new UsageError("Only http, https, hf, and local file paths are supported.");
     }
 
     return { filePath: path.resolve(rawValue) };
@@ -272,12 +372,31 @@ function generateEntrypoint({ chunkNames, fileName, sha256 }) {
   ].join("\n");
 }
 
+function getHuggingFaceToken() {
+  return process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN || process.env.HUGGING_FACE_HUB_TOKEN || "";
+}
+
+function createRequestHeaders(url) {
+  const headers = {};
+  const token = getHuggingFaceToken();
+
+  if (token && url.hostname === HUGGING_FACE_HOST) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  return headers;
+}
+
 function request(urlString) {
   const url = new URL(urlString);
   const client = url.protocol === "https:" ? https : http;
+  const headers = createRequestHeaders(url);
 
   return new Promise((resolve, reject) => {
-    const req = client.get(url, (response) => resolve(response));
+    const req =
+      Object.keys(headers).length > 0
+        ? client.get(url, { headers }, (response) => resolve(response))
+        : client.get(url, (response) => resolve(response));
     req.on("error", reject);
   });
 }
@@ -505,12 +624,14 @@ if (require.main === module) {
 module.exports = {
   DEFAULT_CHUNK_SIZE_BYTES,
   UsageError,
+  buildHuggingFaceUrl,
   createChunkName,
   deriveFileName,
   downloadFileInChunks,
   generateDockerfile,
   generateEntrypoint,
   parseArgs,
+  parseHuggingFaceSource,
   parseSourceInput,
   run,
   runCli,

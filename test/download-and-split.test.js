@@ -29,15 +29,21 @@ async function withMockedRequests(routes, action) {
     return routes[key];
   }
 
-  function mockedGet(urlValue, callback) {
+  function mockedGet(urlValue, optionsValue, callbackValue) {
+    const options = typeof optionsValue === "function" ? {} : optionsValue ?? {};
+    const callback = typeof optionsValue === "function" ? optionsValue : callbackValue;
     const request = new EventEmitter();
 
     process.nextTick(() => {
-      const route = getRoute(urlValue);
+      let route = getRoute(urlValue);
 
       if (!route) {
         request.emit("error", new Error(`No mocked response for ${urlValue}`));
         return;
+      }
+
+      if (typeof route === "function") {
+        route = route({ url: urlValue instanceof URL ? urlValue.toString() : String(urlValue), options });
       }
 
       const response = Readable.from(route.chunks ?? [route.body ?? Buffer.alloc(0)]);
@@ -62,6 +68,32 @@ async function withMockedRequests(routes, action) {
 
 function createPayload(size, seed = "x") {
   return Buffer.from(seed.repeat(size), "utf8");
+}
+
+async function withEnv(env, action) {
+  const previousValues = new Map();
+
+  for (const [key, value] of Object.entries(env)) {
+    previousValues.set(key, process.env[key]);
+
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+
+  try {
+    return await action();
+  } finally {
+    for (const [key, value] of previousValues.entries()) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
 }
 
 test("downloads a single chunk and generates one explicit Docker COPY", async (t) => {
@@ -168,6 +200,53 @@ test("parses stdin as chunk input", () => {
 
   assert.equal(options.stdin, true);
   assert.equal(options.fileName, "streamed-image.tar");
+});
+
+test("parses Hugging Face model sources as download URLs", () => {
+  const options = parseArgs([
+    "hf://meta-llama/Llama-3.1-8B-Instruct/resolve/main/model.safetensors",
+  ]);
+
+  assert.equal(
+    options.url,
+    "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/resolve/main/model.safetensors",
+  );
+  assert.equal(options.fileName, "model.safetensors");
+  assert.deepEqual(options.huggingFace, {
+    repoType: "model",
+    repoId: "meta-llama/Llama-3.1-8B-Instruct",
+    revision: "main",
+    filePath: "model.safetensors",
+  });
+});
+
+test("parses Hugging Face dataset and encoded revision sources", () => {
+  const options = parseArgs([
+    "hf://datasets/lhoestq/demo1/resolve/refs%2Fpr%2F1/data/train.jsonl",
+  ]);
+
+  assert.equal(
+    options.url,
+    "https://huggingface.co/datasets/lhoestq/demo1/resolve/refs%2Fpr%2F1/data/train.jsonl",
+  );
+  assert.deepEqual(options.huggingFace, {
+    repoType: "dataset",
+    repoId: "lhoestq/demo1",
+    revision: "refs/pr/1",
+    filePath: "data/train.jsonl",
+  });
+});
+
+test("preserves casing in Hugging Face repository ids", () => {
+  const options = parseArgs([
+    "hf://TheBloke/Mixtral-8x7B/resolve/main/config.json",
+  ]);
+
+  assert.equal(
+    options.url,
+    "https://huggingface.co/TheBloke/Mixtral-8x7B/resolve/main/config.json",
+  );
+  assert.equal(options.huggingFace.repoId, "TheBloke/Mixtral-8x7B");
 });
 
 test("chunks a local file into an equivalent Docker context", async (t) => {
@@ -283,6 +362,58 @@ test("follows redirects before downloading", async (t) => {
       force: false,
     }),
   );
+
+  const chunkContent = await fs.readFile(path.join(result.chunksDir, result.chunkNames[0]));
+  assert.deepEqual(chunkContent, payload);
+});
+
+test("sends Hugging Face token only to huggingface.co requests", async (t) => {
+  const payload = Buffer.from("huggingface payload");
+  const tempDir = await createTempDir();
+  const hfUrl = "https://huggingface.co/owner/model/resolve/main/file.bin";
+  const redirectUrl = "https://cdn.example.test/file.bin";
+  let huggingFaceAuthorization;
+  let redirectAuthorization;
+
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const result = await withEnv({
+    HF_TOKEN: "hf_secret",
+    HUGGINGFACE_TOKEN: undefined,
+    HUGGING_FACE_HUB_TOKEN: undefined,
+  }, () =>
+    withMockedRequests({
+      [hfUrl]: ({ options }) => {
+        huggingFaceAuthorization = options.headers?.Authorization;
+
+        return {
+          statusCode: 302,
+          headers: { location: redirectUrl },
+        };
+      },
+      [redirectUrl]: ({ options }) => {
+        redirectAuthorization = options.headers?.Authorization;
+
+        return {
+          statusCode: 200,
+          body: payload,
+        };
+      },
+    }, () =>
+      run({
+        url: hfUrl,
+        chunkSizeBytes: 1_000,
+        outDir: tempDir,
+        fileName: "file.bin",
+        force: false,
+      }),
+    ),
+  );
+
+  assert.equal(huggingFaceAuthorization, "Bearer hf_secret");
+  assert.equal(redirectAuthorization, undefined);
 
   const chunkContent = await fs.readFile(path.join(result.chunksDir, result.chunkNames[0]));
   assert.deepEqual(chunkContent, payload);
