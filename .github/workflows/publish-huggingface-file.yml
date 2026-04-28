@@ -1,4 +1,4 @@
-name: Publish Hugging Face File
+name: Publish Hugging Face Download
 
 on:
   workflow_dispatch:
@@ -8,8 +8,8 @@ on:
         required: true
         type: string
       file_path:
-        description: File path inside the Hugging Face repository
-        required: true
+        description: File path inside the Hugging Face repository. Leave blank to pack the full repository.
+        required: false
         type: string
       revision:
         description: Branch, tag, or commit to download from
@@ -83,11 +83,6 @@ jobs:
             exit 1
           fi
 
-          if [ -z "$FILE_PATH" ]; then
-            echo "file_path input is required." >&2
-            exit 1
-          fi
-
           if [ -z "$IMAGE_REPOSITORY" ]; then
             echo "DOCKERHUB_REPOSITORY secret is required." >&2
             exit 1
@@ -119,19 +114,45 @@ jobs:
           esac
 
           resolved_revision="${REVISION:-main}"
-          hf_url="$(
-            REPO_TYPE="$resolved_repo_type" RESOLVED_REVISION="$resolved_revision" node -e '
-              const { buildHuggingFaceUrl } = require("./download-and-split");
-              process.stdout.write(buildHuggingFaceUrl({
-                repoType: process.env.REPO_TYPE,
-                repoId: process.env.REPO_ID,
-                revision: process.env.RESOLVED_REVISION,
-                filePath: process.env.FILE_PATH,
-              }));
-            '
-          )"
 
-          echo "hf_url=$hf_url" >> "$GITHUB_OUTPUT"
+          if [ -n "$FILE_PATH" ]; then
+            hf_url="$(
+              REPO_TYPE="$resolved_repo_type" RESOLVED_REVISION="$resolved_revision" node -e '
+                const { buildHuggingFaceUrl } = require("./download-and-split");
+                process.stdout.write(buildHuggingFaceUrl({
+                  repoType: process.env.REPO_TYPE,
+                  repoId: process.env.REPO_ID,
+                  revision: process.env.RESOLVED_REVISION,
+                  filePath: process.env.FILE_PATH,
+                }));
+              '
+            )"
+
+            echo "mode=file" >> "$GITHUB_OUTPUT"
+            echo "hf_url=$hf_url" >> "$GITHUB_OUTPUT"
+          else
+            archive_name="$FILE_NAME"
+            if [ -z "$archive_name" ]; then
+              archive_name="$(printf '%s-%s' "$REPO_ID" "$resolved_revision" | tr '/:@' '-' | tr -cd 'A-Za-z0-9._-')"
+            else
+              archive_name="$(printf '%s' "$archive_name" | tr '/:@' '-' | tr -cd 'A-Za-z0-9._-')"
+            fi
+
+            archive_name="${archive_name#.}"
+
+            if [ -z "$archive_name" ]; then
+              archive_name="huggingface-repo"
+            fi
+
+            case "$archive_name" in
+              *.tar) ;;
+              *) archive_name="${archive_name}.tar" ;;
+            esac
+
+            echo "mode=repo" >> "$GITHUB_OUTPUT"
+            echo "archive_name=$archive_name" >> "$GITHUB_OUTPUT"
+          fi
+
           echo "repo_id=$REPO_ID" >> "$GITHUB_OUTPUT"
           echo "file_path=$FILE_PATH" >> "$GITHUB_OUTPUT"
           echo "revision=$resolved_revision" >> "$GITHUB_OUTPUT"
@@ -148,20 +169,56 @@ jobs:
         id: generate
         shell: bash
         env:
+          MODE: ${{ steps.config.outputs.mode }}
           HF_URL: ${{ steps.config.outputs.hf_url }}
           HF_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+          REPO_ID: ${{ steps.config.outputs.repo_id }}
+          REPO_TYPE: ${{ steps.config.outputs.repo_type }}
+          REVISION: ${{ steps.config.outputs.revision }}
           CHUNK_MB: ${{ steps.config.outputs.chunk_mb }}
           FILE_NAME: ${{ steps.config.outputs.file_name }}
+          ARCHIVE_NAME: ${{ steps.config.outputs.archive_name }}
         run: |
           set -euo pipefail
 
-          args=(download-and-split.js "$HF_URL" --chunk-mb "$CHUNK_MB" --out-dir ./output --force)
+          if [ "$MODE" = "file" ]; then
+            args=(download-and-split.js "$HF_URL" --chunk-mb "$CHUNK_MB" --out-dir ./output --force)
 
-          if [ -n "${FILE_NAME:-}" ]; then
-            args+=(--name "$FILE_NAME")
+            if [ -n "${FILE_NAME:-}" ]; then
+              args+=(--name "$FILE_NAME")
+            fi
+
+            run_output="$(node "${args[@]}")"
+          else
+            python -m pip install --user --upgrade huggingface_hub
+
+            repo_dir="${RUNNER_TEMP:-/tmp}/huggingface-repo"
+            rm -rf "$repo_dir"
+            mkdir -p "$repo_dir"
+
+            REPO_DIR="$repo_dir" python - <<'PY'
+          import os
+          import shutil
+          from huggingface_hub import snapshot_download
+
+          repo_type = os.environ["REPO_TYPE"]
+          if repo_type == "model":
+              repo_type = None
+
+          snapshot_download(
+              repo_id=os.environ["REPO_ID"],
+              repo_type=repo_type,
+              revision=os.environ["REVISION"],
+              local_dir=os.environ["REPO_DIR"],
+              token=os.environ.get("HF_TOKEN") or None,
+          )
+
+          shutil.rmtree(os.path.join(os.environ["REPO_DIR"], ".cache"), ignore_errors=True)
+          PY
+
+            run_output="$(tar -C "$repo_dir" -cf - . | node download-and-split.js - --chunk-mb "$CHUNK_MB" --out-dir ./output --name "$ARCHIVE_NAME" --force)"
           fi
 
-          run_output="$(node "${args[@]}")"
           printf '%s\n' "$run_output"
 
           context_dir="$(printf '%s\n' "$run_output" | awk -F': ' '/^Output:/ {print $2}')"
@@ -197,6 +254,8 @@ jobs:
           FILE_PATH: ${{ steps.config.outputs.file_path }}
           REVISION: ${{ steps.config.outputs.revision }}
           REPO_TYPE: ${{ steps.config.outputs.repo_type }}
+          MODE: ${{ steps.config.outputs.mode }}
+          ARCHIVE_NAME: ${{ steps.config.outputs.archive_name }}
           IMAGE_REPOSITORY: ${{ steps.config.outputs.image_repository }}
           IMAGE_TAG: ${{ steps.config.outputs.image_tag }}
           CONTEXT_DIR: ${{ steps.generate.outputs.context_dir }}
@@ -204,7 +263,12 @@ jobs:
           {
             echo "## Docker publish complete"
             echo
-            echo "- Hugging Face source: \`$REPO_TYPE/$REPO_ID@$REVISION:$FILE_PATH\`"
+            if [ "$MODE" = "file" ]; then
+              echo "- Hugging Face file: \`$REPO_TYPE/$REPO_ID@$REVISION:$FILE_PATH\`"
+            else
+              echo "- Hugging Face repository: \`$REPO_TYPE/$REPO_ID@$REVISION\`"
+              echo "- Archive name: \`$ARCHIVE_NAME\`"
+            fi
             echo "- Image: \`$IMAGE_REPOSITORY:$IMAGE_TAG\`"
             echo "- Extra tag: \`$IMAGE_REPOSITORY:sha-${GITHUB_SHA}\`"
             echo "- Build context: \`$CONTEXT_DIR\`"
